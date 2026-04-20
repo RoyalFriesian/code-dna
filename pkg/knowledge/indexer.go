@@ -17,6 +17,7 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 	}
 
 	repo := NewRepo(absPath, cfg.GetIndexModel())
+	repoID := repo.ID
 	manifest := Manifest{Repo: repo}
 
 	// Phase 1: Scan
@@ -36,7 +37,7 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 	manifest.Repo = repo
 
 	// Write L0 tree
-	if err := WriteTree(cfg, repo.ID, scanResult.Tree); err != nil {
+	if err := WriteTree(cfg, repoID, scanResult.Tree); err != nil {
 		return nil, fmt.Errorf("write tree: %w", err)
 	}
 
@@ -63,13 +64,11 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 		return nil, fmt.Errorf("l1 summarize: %w", err)
 	}
 
-	// Set repo ID on all summaries
 	for i := range l1Summaries {
-		l1Summaries[i].RepoID = repo.ID
+		l1Summaries[i].RepoID = repoID
 	}
 
-	// Write L1 summaries
-	if err := WriteAgentSummaries(cfg, repo.ID, 1, l1Summaries); err != nil {
+	if err := WriteAgentSummaries(cfg, repoID, 1, l1Summaries); err != nil {
 		return nil, fmt.Errorf("write l1: %w", err)
 	}
 
@@ -78,17 +77,239 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 		l1Tokens += s.Tokens
 	}
 	manifest.Levels = append(manifest.Levels, Level{
-		RepoID:      repo.ID,
+		RepoID:      repoID,
 		Number:      1,
 		AgentCount:  len(l1Summaries),
 		TotalTokens: l1Tokens,
 	})
 
-	// Phase 4: Recursive compression
+	// Phases 4-6: compression → service docs → agent guide
+	return finalizePipeline(ctx, client, cfg, absPath, repoID, manifest, l1Summaries, scanResult.Tree, progress)
+}
+
+// ReindexRepo performs true incremental re-indexing.
+//
+// It compares the current on-disk SHA hashes with the previously stored tree to
+// classify every file as unchanged, modified, added, or deleted. Only the L1
+// agent summaries whose file set intersects with the changed set are
+// re-summarized; the rest are reused verbatim. New and modified files are
+// redistributed into fresh agent assignments. Deleted files are dropped from
+// their former agents. After the merged L1 is produced, the full compression
+// hierarchy (L2 … Ln) and post-processing phases (service docs, agent guide)
+// are rebuilt from scratch.
+//
+// The second return value is the number of files that triggered a change
+// (adds + modifications + deletions). It is 0 when nothing changed.
+func ReindexRepo(ctx context.Context, client CompletionClient, repoPath string, cfg Config, progress ProgressFunc) (*Manifest, int, error) {
+	absPath, err := filepath.Abs(repoPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("resolve path: %w", err)
+	}
+
+	repoID := RepoID(absPath)
+	oldManifest, err := ReadManifest(cfg, repoID)
+	if err != nil {
+		// No prior index — full index.
+		m, err := IndexRepo(ctx, client, repoPath, cfg, progress)
+		if err != nil {
+			return nil, 0, err
+		}
+		return m, m.Repo.FileCount, nil
+	}
+
+	// Phase 1: Scan current state.
+	if progress != nil {
+		progress("scanning", 0, 0)
+	}
+	scanResult, err := ScanRepo(absPath, cfg.ScanMode)
+	if err != nil {
+		return nil, 0, fmt.Errorf("scan: %w", err)
+	}
+
+	// Read old tree; fall back to full index if it is missing or corrupt.
+	oldTree, err := ReadTree(cfg, repoID)
+	if err != nil {
+		m, err := IndexRepo(ctx, client, repoPath, cfg, progress)
+		if err != nil {
+			return nil, 0, err
+		}
+		return m, m.Repo.FileCount, nil
+	}
+
+	// Build lookup tables.
+	oldHashes := make(map[string]string, len(oldTree))
+	for _, n := range oldTree {
+		oldHashes[n.Path] = n.Hash
+	}
+	newByPath := make(map[string]TreeNode, len(scanResult.Tree))
+	for _, n := range scanResult.Tree {
+		newByPath[n.Path] = n
+	}
+
+	// Classify every file.
+	deleted := make(map[string]bool)
+	modified := make(map[string]bool)
+	added := make(map[string]bool)
+
+	for path, oldHash := range oldHashes {
+		if n, exists := newByPath[path]; !exists {
+			deleted[path] = true
+		} else if n.Hash != oldHash {
+			modified[path] = true
+		}
+	}
+	for path := range newByPath {
+		if _, exists := oldHashes[path]; !exists {
+			added[path] = true
+		}
+	}
+
+	changedCount := len(deleted) + len(modified) + len(added)
+	if changedCount == 0 {
+		if progress != nil {
+			progress("no-changes", 0, 0)
+		}
+		return &oldManifest, 0, nil
+	}
+
+	if progress != nil {
+		progress("scanned", scanResult.FileCount, scanResult.FileCount)
+	}
+
+	// Read old L1 summaries; fall back to full index if unavailable.
+	oldL1, err := ReadAgentSummaries(cfg, repoID, 1)
+	if err != nil || len(oldL1) == 0 {
+		m, err := IndexRepo(ctx, client, repoPath, cfg, progress)
+		if err != nil {
+			return nil, 0, err
+		}
+		return m, changedCount, nil
+	}
+
+	// Identify dirty agents: any agent whose file set overlaps with the
+	// changed or deleted set must be re-summarized.
+	dirtyAgentIdx := make(map[int]bool)
+	for i, agent := range oldL1 {
+		for _, fp := range agent.FilePaths {
+			if deleted[fp] || modified[fp] {
+				dirtyAgentIdx[i] = true
+				break
+			}
+		}
+	}
+
+	// Separate clean agents from the dirty pool.
+	var cleanSummaries []AgentSummary
+	dirtyFileSet := make(map[string]bool)
+	for i, agent := range oldL1 {
+		if dirtyAgentIdx[i] {
+			// Pool surviving (non-deleted) files for re-summarization.
+			for _, fp := range agent.FilePaths {
+				if !deleted[fp] {
+					dirtyFileSet[fp] = true
+				}
+			}
+		} else {
+			cleanSummaries = append(cleanSummaries, agent)
+		}
+	}
+	// New files always enter the dirty pool.
+	for fp := range added {
+		dirtyFileSet[fp] = true
+	}
+
+	// Re-summarize the dirty pool.
+	var newSummaries []AgentSummary
+	if len(dirtyFileSet) > 0 {
+		var dirtyNodes []TreeNode
+		for fp := range dirtyFileSet {
+			if n, ok := newByPath[fp]; ok {
+				dirtyNodes = append(dirtyNodes, n)
+			}
+		}
+		if progress != nil {
+			progress("distributing", 0, 0)
+		}
+		newAssignments := DistributeFiles(dirtyNodes, cfg)
+		newSummaries, err = SummarizeAllAgents(ctx, client, cfg.GetIndexModel(), absPath, newAssignments, cfg, progress)
+		if err != nil {
+			return nil, 0, fmt.Errorf("incremental l1 summarize: %w", err)
+		}
+	}
+
+	// Merge clean + new summaries and renumber contiguously.
+	allL1 := make([]AgentSummary, 0, len(cleanSummaries)+len(newSummaries))
+	allL1 = append(allL1, cleanSummaries...)
+	allL1 = append(allL1, newSummaries...)
+	if len(allL1) == 0 {
+		return nil, 0, fmt.Errorf("no files remain after applying changes in %s", absPath)
+	}
+	for i := range allL1 {
+		allL1[i].Index = i
+		allL1[i].RepoID = repoID
+	}
+
+	// Persist the updated tree and merged L1.
+	if err := WriteTree(cfg, repoID, scanResult.Tree); err != nil {
+		return nil, 0, fmt.Errorf("write tree: %w", err)
+	}
+	if err := WriteAgentSummaries(cfg, repoID, 1, allL1); err != nil {
+		return nil, 0, fmt.Errorf("write l1: %w", err)
+	}
+
+	// Rebuild manifest from the merged L1 (compression levels are always
+	// regenerated by finalizePipeline).
+	repo := oldManifest.Repo
+	repo.FileCount = scanResult.FileCount
+	repo.Status = "indexing"
+	repo.UpdatedAt = time.Now().UTC()
+
+	l1Tokens := 0
+	for _, s := range allL1 {
+		l1Tokens += s.Tokens
+	}
+	manifest := Manifest{
+		Repo: repo,
+		Levels: []Level{{
+			RepoID:      repoID,
+			Number:      1,
+			AgentCount:  len(allL1),
+			TotalTokens: l1Tokens,
+		}},
+	}
+
+	// Phases 4-6: compression → service docs → agent guide.
+	result, err := finalizePipeline(ctx, client, cfg, absPath, repoID, manifest, allL1, scanResult.Tree, progress)
+	if err != nil {
+		return nil, 0, err
+	}
+	return result, changedCount, nil
+}
+
+// finalizePipeline runs the compression loop (phase 4) and the post-processing
+// phases (service docs, agent guide) given a ready L1 summary set. It writes
+// the manifest and returns the final result.
+//
+// The incoming manifest must already contain the L1 Level entry and a Repo
+// with Status = "indexing".
+func finalizePipeline(
+	ctx context.Context,
+	client CompletionClient,
+	cfg Config,
+	absPath string,
+	repoID string,
+	manifest Manifest,
+	l1Summaries []AgentSummary,
+	tree []TreeNode,
+	progress ProgressFunc,
+) (*Manifest, error) {
+	repo := manifest.Repo
+
+	// Phase 4: Recursive compression.
 	currentSummaries := l1Summaries
 	currentLevel := 1
-	const maxLevels = 10    // safety bound
-	var cmap CompressionMap // accumulated across compression iterations
+	const maxLevels = 10
+	var cmap CompressionMap
 
 	for currentLevel < maxLevels {
 		totalTokens := 0
@@ -97,7 +318,7 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 		}
 
 		if totalTokens <= cfg.TargetTokens {
-			// Produce master context
+			// Everything fits — produce the master context directly.
 			if progress != nil {
 				progress("master-context", 0, 0)
 			}
@@ -107,19 +328,15 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 			}
 			currentLevel++
 			masterContent := compressed[0].Summary
-
 			cmap.Levels = append(cmap.Levels, buildLevelIndex(currentLevel, compressed))
-
-			if err := WriteMasterContext(cfg, repo.ID, currentLevel, masterContent); err != nil {
+			if err := WriteMasterContext(cfg, repoID, currentLevel, masterContent); err != nil {
 				return nil, fmt.Errorf("write master context: %w", err)
 			}
-
-			if err := WriteCompressionMap(cfg, repo.ID, currentLevel, cmap); err != nil {
+			if err := WriteCompressionMap(cfg, repoID, currentLevel, cmap); err != nil {
 				return nil, fmt.Errorf("write compression map: %w", err)
 			}
-
 			manifest.Levels = append(manifest.Levels, Level{
-				RepoID:      repo.ID,
+				RepoID:      repoID,
 				Number:      currentLevel,
 				AgentCount:  1,
 				TotalTokens: estimateTokens(int64(len(masterContent))),
@@ -127,75 +344,61 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 			break
 		}
 
-		// Compress to next level
+		// Compress to next level.
 		if progress != nil {
 			progress(fmt.Sprintf("compressing-l%d", currentLevel+1), 0, len(currentSummaries))
 		}
-
 		compressed, isMaster, err := CompressLevel(ctx, client, cfg.GetIndexModel(), currentSummaries, currentLevel, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("compress level %d: %w", currentLevel+1, err)
 		}
-
 		currentLevel++
+
+		cmap.Levels = append(cmap.Levels, buildLevelIndex(currentLevel, compressed))
 
 		if isMaster {
 			masterContent := compressed[0].Summary
-
-			cmap.Levels = append(cmap.Levels, buildLevelIndex(currentLevel, compressed))
-
-			if err := WriteMasterContext(cfg, repo.ID, currentLevel, masterContent); err != nil {
+			if err := WriteMasterContext(cfg, repoID, currentLevel, masterContent); err != nil {
 				return nil, fmt.Errorf("write master context: %w", err)
 			}
-			if err := WriteCompressionMap(cfg, repo.ID, currentLevel, cmap); err != nil {
+			if err := WriteCompressionMap(cfg, repoID, currentLevel, cmap); err != nil {
 				return nil, fmt.Errorf("write compression map: %w", err)
 			}
-
-			compressedTokens := estimateTokens(int64(len(masterContent)))
 			manifest.Levels = append(manifest.Levels, Level{
-				RepoID:      repo.ID,
+				RepoID:      repoID,
 				Number:      currentLevel,
 				AgentCount:  1,
-				TotalTokens: compressedTokens,
+				TotalTokens: estimateTokens(int64(len(masterContent))),
 			})
 			break
 		}
 
-		// Record compression routing for this level
-		cmap.Levels = append(cmap.Levels, buildLevelIndex(currentLevel, compressed))
-
-		// Set repo ID on compressed summaries
 		for i := range compressed {
-			compressed[i].RepoID = repo.ID
+			compressed[i].RepoID = repoID
 		}
-
-		if err := WriteAgentSummaries(cfg, repo.ID, currentLevel, compressed); err != nil {
+		if err := WriteAgentSummaries(cfg, repoID, currentLevel, compressed); err != nil {
 			return nil, fmt.Errorf("write level %d: %w", currentLevel, err)
 		}
-
 		compressedTokens := 0
 		for _, s := range compressed {
 			compressedTokens += s.Tokens
 		}
 		manifest.Levels = append(manifest.Levels, Level{
-			RepoID:      repo.ID,
+			RepoID:      repoID,
 			Number:      currentLevel,
 			AgentCount:  len(compressed),
 			TotalTokens: compressedTokens,
 		})
-
 		currentSummaries = compressed
-
 		if progress != nil {
 			progress(fmt.Sprintf("compressed-l%d", currentLevel), len(compressed), len(compressed))
 		}
 	}
 
-	// Finalize
+	// Finalize repo metadata.
 	repo.LevelsCount = currentLevel
 	repo.Status = "ready"
 	repo.UpdatedAt = time.Now().UTC()
-
 	totalTokens := 0
 	for _, l := range manifest.Levels {
 		totalTokens += l.TotalTokens
@@ -208,7 +411,7 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 	}
 
 	// Phase 5: Generate service architecture documents (non-fatal).
-	services := DetectServices(absPath, scanResult.Tree)
+	services := DetectServices(absPath, tree)
 	if _, err := GenerateServiceDocs(ctx, client, absPath, cfg, manifest, progress); err != nil {
 		fmt.Fprintf(os.Stderr, "service-docs warning: %v\n", err)
 	}
@@ -223,83 +426,6 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 	}
 
 	return &manifest, nil
-}
-
-// ReindexRepo performs incremental re-indexing by comparing file hashes.
-func ReindexRepo(ctx context.Context, client CompletionClient, repoPath string, cfg Config, progress ProgressFunc) (*Manifest, int, error) {
-	absPath, err := filepath.Abs(repoPath)
-	if err != nil {
-		return nil, 0, fmt.Errorf("resolve path: %w", err)
-	}
-
-	repoID := RepoID(absPath)
-	oldManifest, err := ReadManifest(cfg, repoID)
-	if err != nil {
-		// No existing index — do a full index
-		m, err := IndexRepo(ctx, client, repoPath, cfg, progress)
-		if err != nil {
-			return nil, 0, err
-		}
-		return m, m.Repo.FileCount, nil
-	}
-
-	// Scan current state
-	scanResult, err := ScanRepo(absPath, cfg.ScanMode)
-	if err != nil {
-		return nil, 0, fmt.Errorf("scan: %w", err)
-	}
-
-	// Read old tree and build hash map
-	oldTree, err := ReadTree(cfg, repoID)
-	if err != nil {
-		// Corrupted — full reindex
-		m, err := IndexRepo(ctx, client, repoPath, cfg, progress)
-		if err != nil {
-			return nil, 0, err
-		}
-		return m, m.Repo.FileCount, nil
-	}
-
-	oldHashes := make(map[string]string)
-	for _, n := range oldTree {
-		oldHashes[n.Path] = n.Hash
-	}
-
-	// Find changed files
-	var changedFiles int
-	for _, n := range scanResult.Tree {
-		if oldHash, exists := oldHashes[n.Path]; !exists || oldHash != n.Hash {
-			changedFiles++
-		}
-	}
-
-	// Check for deleted files
-	newPaths := make(map[string]bool)
-	for _, n := range scanResult.Tree {
-		newPaths[n.Path] = true
-	}
-	for _, n := range oldTree {
-		if !newPaths[n.Path] {
-			changedFiles++
-		}
-	}
-
-	if changedFiles == 0 {
-		if progress != nil {
-			progress("no-changes", 0, 0)
-		}
-		return &oldManifest, 0, nil
-	}
-
-	// For now, if there are changes, do a full reindex.
-	// A more sophisticated version would only re-summarize affected L1 agents
-	// and cascade upward.
-	_ = oldManifest
-	m, err := IndexRepo(ctx, client, repoPath, cfg, progress)
-	if err != nil {
-		return nil, 0, err
-	}
-	return m, changedFiles, nil
 }
 
 // buildLevelIndex creates a LevelIndex from compressed summaries, mapping each
