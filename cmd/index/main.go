@@ -50,9 +50,21 @@ func main() {
 	loadEnvFile(".env")
 	loadEnvFile(filepath.Join(filepath.Dir(os.Args[0]), ".env"))
 
+	// Flags: [-reindex] [path]
+	reindex := false
+	args := os.Args[1:]
+	var filteredArgs []string
+	for _, a := range args {
+		if a == "-reindex" || a == "--reindex" {
+			reindex = true
+		} else {
+			filteredArgs = append(filteredArgs, a)
+		}
+	}
+
 	target := "."
-	if len(os.Args) > 1 {
-		target = os.Args[1]
+	if len(filteredArgs) > 0 {
+		target = filteredArgs[0]
 	}
 	abs, err := filepath.Abs(target)
 	if err != nil {
@@ -79,27 +91,45 @@ func main() {
 		}
 	}
 
-	fmt.Printf("Indexing %s ...\n", abs)
-	manifest, err := knowledge.IndexRepo(context.Background(), client, abs, cfg, progress)
-	if err != nil {
-		log.Fatalf("IndexRepo: %v", err)
-	}
-
-	fmt.Printf("\n=== Done in %s ===\n", time.Since(t0).Round(time.Second))
-	fmt.Printf("ID=%s  files=%d  levels=%d  tokens=%d  status=%s\n",
-		manifest.Repo.ID, manifest.Repo.FileCount, manifest.Repo.LevelsCount,
-		manifest.Repo.TotalTokens, manifest.Repo.Status)
-	for _, l := range manifest.Levels {
-		fmt.Printf("  L%d: %d agents, %d tokens\n", l.Number, l.AgentCount, l.TotalTokens)
-	}
-
-	mc, err := knowledge.ReadMasterContext(cfg, manifest.Repo.ID, *manifest)
-	if err == nil {
-		fmt.Printf("\nMaster context: %d bytes\n", len(mc))
-		preview := mc
-		if len(preview) > 2000 {
-			preview = preview[:2000] + "\n...(truncated)"
+	if reindex {
+		fmt.Printf("Incremental reindex of %s ...\n", abs)
+		manifest, changed, err := knowledge.ReindexRepo(context.Background(), client, abs, cfg, progress)
+		if err != nil {
+			log.Fatalf("ReindexRepo: %v", err)
 		}
-		fmt.Println(preview)
+		fmt.Printf("\n=== Done in %s ===\n", time.Since(t0).Round(time.Second))
+		fmt.Printf("ID=%s  files=%d  changed=%d  levels=%d  tokens=%d  status=%s\n",
+			manifest.Repo.ID, manifest.Repo.FileCount, changed,
+			manifest.Repo.LevelsCount, manifest.Repo.TotalTokens, manifest.Repo.Status)
+		for _, l := range manifest.Levels {
+			fmt.Printf("  L%d: %d agents, %d tokens\n", l.Number, l.AgentCount, l.TotalTokens)
+		}
+		if changed == 0 {
+			fmt.Println("Nothing changed — existing index is up to date.")
+			return
+		}
+	} else {
+		fmt.Printf("Indexing %s ...\n", abs)
+		manifest, err := knowledge.IndexRepo(context.Background(), client, abs, cfg, progress)
+		if err != nil {
+			log.Fatalf("IndexRepo: %v", err)
+		}
+		fmt.Printf("\n=== Done in %s ===\n", time.Since(t0).Round(time.Second))
+		fmt.Printf("ID=%s  files=%d  levels=%d  tokens=%d  status=%s\n",
+			manifest.Repo.ID, manifest.Repo.FileCount, manifest.Repo.LevelsCount,
+			manifest.Repo.TotalTokens, manifest.Repo.Status)
+		for _, l := range manifest.Levels {
+			fmt.Printf("  L%d: %d agents, %d tokens\n", l.Number, l.AgentCount, l.TotalTokens)
+		}
+
+		mc, err := knowledge.ReadMasterContext(cfg, manifest.Repo.ID, *manifest)
+		if err == nil {
+			fmt.Printf("\nMaster context: %d bytes\n", len(mc))
+			preview := mc
+			if len(preview) > 2000 {
+				preview = preview[:2000] + "\n...(truncated)"
+			}
+			fmt.Println(preview)
+		}
 	}
 }
