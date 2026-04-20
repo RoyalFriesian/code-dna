@@ -40,16 +40,11 @@ type ollamaChatRequest struct {
 	Model    string          `json:"model"`
 	Messages []ollamaMessage `json:"messages"`
 	Stream   bool            `json:"stream"`
-	Options  ollamaOptions   `json:"options,omitempty"`
 }
 
 type ollamaMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
-}
-
-type ollamaOptions struct {
-	NumCtx int `json:"num_ctx,omitempty"` // context window size
 }
 
 // ollamaChatResponse is the JSON body returned by /api/chat (stream:false).
@@ -72,9 +67,9 @@ func (c *OllamaClient) Generate(ctx context.Context, _ /*model*/ string, systemP
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		},
-		Options: ollamaOptions{
-			NumCtx: 32768, // generous context; Ollama will cap at model max
-		},
+		// No NumCtx override — let Ollama use the model's native context window.
+		// gemma4:e2b natively supports 131,072 tokens; forcing a lower value here
+		// would silently cap it.
 	}
 
 	body, err := json.Marshal(payload)
