@@ -34,6 +34,17 @@ func (c Config) GetIndexModel() string {
 	return c.Model
 }
 
+// GetActiveModelLabel returns a human-readable label for the model actually
+// used during indexing. For Ollama it returns "ollama/<model>"; for OpenAI it
+// returns the standard model name. This is stored in the manifest so tooling
+// knows what backend produced the knowledge base.
+func (c Config) GetActiveModelLabel() string {
+	if c.LLMProvider == "ollama" {
+		return "ollama/" + c.OllamaModel
+	}
+	return c.GetIndexModel()
+}
+
 // GetQueryModel returns the model for query drill-down. Falls back to Model.
 func (c Config) GetQueryModel() string {
 	if c.QueryModel != "" {

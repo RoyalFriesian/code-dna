@@ -16,7 +16,7 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 		return nil, fmt.Errorf("resolve path: %w", err)
 	}
 
-	repo := NewRepo(absPath, cfg.GetIndexModel())
+	repo := NewRepo(absPath, cfg.GetActiveModelLabel())
 	repoID := repo.ID
 	manifest := Manifest{Repo: repo}
 
