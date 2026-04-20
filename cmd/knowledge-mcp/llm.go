@@ -6,5 +6,5 @@ import (
 )
 
 func newLLMClient(cfg knowledge.Config) knowledge.CompletionClient {
-	return llm.New(cfg.APIKey)
+	return llm.NewFromConfig(cfg)
 }

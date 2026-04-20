@@ -2,9 +2,11 @@
 //
 // Usage:
 //
-//	go run ./cmd/index [path/to/repo]
+//	go run ./cmd/index [--reindex] [path/to/repo]
 //
-// OPENAI_API_KEY must be set (or present in a .env file in the repo root).
+// LLM backend is selected by LLM_PROVIDER env var (default: openai).
+// For OpenAI: set OPENAI_API_KEY.
+// For Ollama:  set LLM_PROVIDER=ollama, OLLAMA_URL, OLLAMA_MODEL (or OLLAMA_CHILD_MODEL).
 package main
 
 import (
@@ -71,15 +73,30 @@ func main() {
 		log.Fatalf("resolve path: %v", err)
 	}
 
-	key := os.Getenv("OPENAI_API_KEY")
-	if key == "" {
-		log.Fatal("OPENAI_API_KEY is required (set it in your environment or a .env file)")
+	cfg := knowledge.ConfigFromEnv()
+
+	// Validate required config per provider.
+	provider := llm.Provider(cfg.LLMProvider)
+	if provider == "" {
+		provider = llm.ProviderOpenAI
+	}
+	switch provider {
+	case llm.ProviderOllama:
+		if cfg.OllamaURL == "" {
+			log.Fatal("OLLAMA_URL is required when LLM_PROVIDER=ollama")
+		}
+		if cfg.OllamaModel == "" {
+			log.Fatal("OLLAMA_MODEL (or OLLAMA_CHILD_MODEL) is required when LLM_PROVIDER=ollama")
+		}
+		fmt.Printf("LLM provider: ollama  url=%s  model=%s\n", cfg.OllamaURL, cfg.OllamaModel)
+	default:
+		if cfg.APIKey == "" {
+			log.Fatal("OPENAI_API_KEY is required when LLM_PROVIDER=openai (or unset)")
+		}
+		fmt.Printf("LLM provider: openai  model=%s\n", cfg.GetIndexModel())
 	}
 
-	cfg := knowledge.ConfigFromEnv()
-	cfg.APIKey = key
-
-	client := llm.New(key)
+	client := llm.NewFromConfig(cfg)
 
 	t0 := time.Now()
 	progress := func(stage string, current, total int) {

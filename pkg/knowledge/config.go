@@ -15,6 +15,9 @@ type Config struct {
 	QueryModel       string   // LLM model for query drill-down decisions (can be cheap)
 	ReasoningModel   string   // LLM model for final answer reasoning (should be strong)
 	APIKey           string   // OpenAI API key
+	LLMProvider      string   // "openai" (default) or "ollama"
+	OllamaURL        string   // Ollama base URL, e.g. "http://192.168.68.109:11434"
+	OllamaModel      string   // Ollama model tag, e.g. "gemma4:e2b"
 	TargetTokens     int      // Max tokens for master context (~80K)
 	CompressionRatio float64  // Target compression per level (0.10 = 10%)
 	Concurrency      int      // Worker pool size for L1 summarization
@@ -96,6 +99,19 @@ func ConfigFromEnv() Config {
 	}
 	if v := os.Getenv("OPENAI_API_KEY"); v != "" {
 		cfg.APIKey = v
+	}
+	// LLM provider selection: LLM_PROVIDER=openai|ollama
+	if v := os.Getenv("LLM_PROVIDER"); v != "" {
+		cfg.LLMProvider = v
+	}
+	// Ollama settings — OLLAMA_URL and OLLAMA_MODEL (OLLAMA_CHILD_MODEL accepted as alias)
+	if v := os.Getenv("OLLAMA_URL"); v != "" {
+		cfg.OllamaURL = v
+	}
+	if v := os.Getenv("OLLAMA_MODEL"); v != "" {
+		cfg.OllamaModel = v
+	} else if v := os.Getenv("OLLAMA_CHILD_MODEL"); v != "" {
+		cfg.OllamaModel = v
 	}
 	if v := os.Getenv("KNOWLEDGE_TARGET_TOKENS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
