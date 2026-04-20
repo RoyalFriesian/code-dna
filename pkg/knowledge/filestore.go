@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -186,6 +187,89 @@ func ReadCompressionMap(cfg Config, repoID string, manifest Manifest) (Compressi
 	err := readJSON(filepath.Join(cfg.RepoDir(repoID), fmt.Sprintf("l%d", level), "compression-map.json"), &cm)
 	return cm, err
 }
+
+// ---------------------------------------------------------------------------
+// Service docs
+// ---------------------------------------------------------------------------
+
+// WriteServiceDoc writes a generated service architecture document.
+func WriteServiceDoc(cfg Config, repoID string, doc ServiceDoc) error {
+	dir := filepath.Join(cfg.RepoDir(repoID), "service-docs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, doc.ServiceName+".md"), []byte(doc.Content), 0o644)
+}
+
+// ReadServiceDoc reads a named service document.
+func ReadServiceDoc(cfg Config, repoID, serviceName string) (ServiceDoc, error) {
+	path := filepath.Join(cfg.RepoDir(repoID), "service-docs", serviceName+".md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ServiceDoc{}, err
+	}
+	info, _ := os.Stat(path)
+	doc := ServiceDoc{ServiceName: serviceName, Content: string(data)}
+	if info != nil {
+		doc.GeneratedAt = info.ModTime()
+	}
+	return doc, nil
+}
+
+// ListServiceDocs returns the names of all generated service documents.
+func ListServiceDocs(cfg Config, repoID string) ([]string, error) {
+	dir := filepath.Join(cfg.RepoDir(repoID), "service-docs")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, ".md") {
+			names = append(names, strings.TrimSuffix(name, ".md"))
+		}
+	}
+	return names, nil
+}
+
+// ---------------------------------------------------------------------------
+// Agent guide
+// ---------------------------------------------------------------------------
+
+// WriteAgentGuide writes the AI-agent query guide.
+func WriteAgentGuide(cfg Config, repoID string, guide AgentGuide) error {
+	dir := cfg.RepoDir(repoID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "AGENT_GUIDE.md"), []byte(guide.Content), 0o644)
+}
+
+// ReadAgentGuide reads the AI-agent query guide.
+func ReadAgentGuide(cfg Config, repoID string) (AgentGuide, error) {
+	path := filepath.Join(cfg.RepoDir(repoID), "AGENT_GUIDE.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return AgentGuide{}, err
+	}
+	info, _ := os.Stat(path)
+	guide := AgentGuide{Content: string(data)}
+	if info != nil {
+		guide.GeneratedAt = info.ModTime()
+	}
+	return guide, nil
+}
+
+// ---------------------------------------------------------------------------
+// JSON helpers
+// ---------------------------------------------------------------------------
 
 func writeJSON(path string, v interface{}) error {
 	data, err := json.MarshalIndent(v, "", "  ")

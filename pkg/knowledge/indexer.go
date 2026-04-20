@@ -3,6 +3,7 @@ package knowledge
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -204,6 +205,17 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 
 	if err := WriteManifest(cfg, manifest); err != nil {
 		return nil, fmt.Errorf("write manifest: %w", err)
+	}
+
+	// Phase 5: Generate service architecture documents (non-fatal).
+	services := DetectServices(absPath, scanResult.Tree)
+	if _, err := GenerateServiceDocs(ctx, client, absPath, cfg, manifest, progress); err != nil {
+		fmt.Fprintf(os.Stderr, "service-docs warning: %v\n", err)
+	}
+
+	// Phase 6: Generate AI agent guide (non-fatal).
+	if _, err := GenerateAgentGuide(ctx, client, cfg, manifest, services, progress); err != nil {
+		fmt.Fprintf(os.Stderr, "agent-guide warning: %v\n", err)
 	}
 
 	if progress != nil {

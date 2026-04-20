@@ -55,7 +55,31 @@ type RepoInfo struct {
 	Model     string `json:"model"`
 }
 
-// --- reindex_repo ---
+// --- get_service_docs ---
+
+type GetServiceDocsInput struct {
+	Path        string `json:"path" jsonschema:"Path to the indexed repository"`
+	ServiceName string `json:"serviceName,omitempty" jsonschema:"Optional: name of a specific service. Omit to list all service docs."`
+}
+
+type GetServiceDocsOutput struct {
+	Services []ServiceDocInfo `json:"services"`
+}
+
+type ServiceDocInfo struct {
+	Name    string `json:"name"`
+	Content string `json:"content,omitempty"`
+}
+
+// --- get_agent_guide ---
+
+type GetAgentGuideInput struct {
+	Path string `json:"path" jsonschema:"Path to the indexed repository"`
+}
+
+type GetAgentGuideOutput struct {
+	Content string `json:"content"`
+}
 
 type ReindexRepoInput struct {
 	Path string `json:"path" jsonschema:"Path to the repository to re-index incrementally"`
@@ -107,6 +131,24 @@ func registerTools(server *mcp.Server, cfg knowledge.Config, llm knowledge.Compl
 			OpenWorldHint:  boolPtr(false),
 		},
 	}, reindexRepoHandler(cfg, llm))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "get_service_docs",
+		Description: "Retrieve the human-readable architecture documents for services detected in an indexed repository. Returns all service docs when no serviceName is given, or a single doc when serviceName is specified.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:  true,
+			OpenWorldHint: boolPtr(false),
+		},
+	}, getServiceDocsHandler(cfg))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "get_agent_guide",
+		Description: "Retrieve the AI-agent query guide for an indexed repository. The guide explains the knowledge base structure, how to navigate the compression hierarchy, best practices, and worked query examples.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:  true,
+			OpenWorldHint: boolPtr(false),
+		},
+	}, getAgentGuideHandler(cfg))
 }
 
 func indexRepoHandler(cfg knowledge.Config, llm knowledge.CompletionClient) mcp.ToolHandlerFor[IndexRepoInput, IndexRepoOutput] {
@@ -269,6 +311,80 @@ func reindexRepoHandler(cfg knowledge.Config, llm knowledge.CompletionClient) mc
 		}
 
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
+	}
+}
+
+func getServiceDocsHandler(cfg knowledge.Config) mcp.ToolHandlerFor[GetServiceDocsInput, GetServiceDocsOutput] {
+	return func(ctx context.Context, req *mcp.CallToolRequest, input GetServiceDocsInput) (*mcp.CallToolResult, GetServiceDocsOutput, error) {
+		if input.Path == "" {
+			return nil, GetServiceDocsOutput{}, fmt.Errorf("path is required")
+		}
+
+		manifest, found, err := knowledge.FindRepoByPath(cfg, input.Path)
+		if err != nil {
+			return nil, GetServiceDocsOutput{}, fmt.Errorf("lookup repo: %w", err)
+		}
+		if !found {
+			return nil, GetServiceDocsOutput{}, fmt.Errorf("repository not indexed. Run index_repo first")
+		}
+
+		// Single named service requested.
+		if input.ServiceName != "" {
+			doc, err := knowledge.ReadServiceDoc(cfg, manifest.Repo.ID, input.ServiceName)
+			if err != nil {
+				return nil, GetServiceDocsOutput{}, fmt.Errorf("service doc %q not found: %w", input.ServiceName, err)
+			}
+			out := GetServiceDocsOutput{Services: []ServiceDocInfo{{Name: doc.ServiceName, Content: doc.Content}}}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: doc.Content}}}, out, nil
+		}
+
+		// All service docs.
+		names, err := knowledge.ListServiceDocs(cfg, manifest.Repo.ID)
+		if err != nil {
+			return nil, GetServiceDocsOutput{}, fmt.Errorf("list service docs: %w", err)
+		}
+		if len(names) == 0 {
+			msg := "No service documents found. Re-run index_repo to generate them."
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: msg}}}, GetServiceDocsOutput{}, nil
+		}
+
+		var sb strings.Builder
+		var infos []ServiceDocInfo
+		for _, name := range names {
+			doc, err := knowledge.ReadServiceDoc(cfg, manifest.Repo.ID, name)
+			if err != nil {
+				continue
+			}
+			infos = append(infos, ServiceDocInfo{Name: name, Content: doc.Content})
+			sb.WriteString(fmt.Sprintf("\n\n---\n\n# Service: %s\n\n%s", name, doc.Content))
+		}
+
+		out := GetServiceDocsOutput{Services: infos}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: sb.String()}}}, out, nil
+	}
+}
+
+func getAgentGuideHandler(cfg knowledge.Config) mcp.ToolHandlerFor[GetAgentGuideInput, GetAgentGuideOutput] {
+	return func(ctx context.Context, req *mcp.CallToolRequest, input GetAgentGuideInput) (*mcp.CallToolResult, GetAgentGuideOutput, error) {
+		if input.Path == "" {
+			return nil, GetAgentGuideOutput{}, fmt.Errorf("path is required")
+		}
+
+		manifest, found, err := knowledge.FindRepoByPath(cfg, input.Path)
+		if err != nil {
+			return nil, GetAgentGuideOutput{}, fmt.Errorf("lookup repo: %w", err)
+		}
+		if !found {
+			return nil, GetAgentGuideOutput{}, fmt.Errorf("repository not indexed. Run index_repo first")
+		}
+
+		guide, err := knowledge.ReadAgentGuide(cfg, manifest.Repo.ID)
+		if err != nil {
+			return nil, GetAgentGuideOutput{}, fmt.Errorf("agent guide not found — re-run index_repo to generate it: %w", err)
+		}
+
+		out := GetAgentGuideOutput{Content: guide.Content}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: guide.Content}}}, out, nil
 	}
 }
 

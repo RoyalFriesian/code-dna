@@ -97,3 +97,37 @@ type Source struct {
 	Symbols string `json:"symbols,omitempty"`
 	Note    string `json:"note,omitempty"`
 }
+
+// ServiceInfo describes a detected service (deployable unit) within a repository.
+type ServiceInfo struct {
+	// Name is the human-readable service name derived from the directory or
+	// package name (e.g. "api-server", "worker", "knowledge-mcp").
+	Name string `json:"name"`
+
+	// RootPath is the absolute path to the top-level directory of this service
+	// (e.g. /project/cmd/api or /project/services/worker).
+	RootPath string `json:"rootPath"`
+
+	// EntryPoint is the relative path of the main entry point file, when one
+	// can be determined (e.g. "cmd/api/main.go").
+	EntryPoint string `json:"entryPoint,omitempty"`
+
+	// Files is the set of relative file paths that belong to this service.
+	Files []string `json:"files"`
+}
+
+// ServiceDoc is the LLM-generated human-readable architecture document for
+// one detected service.  Content is GitHub-flavoured Markdown with embedded
+// Mermaid diagrams.
+type ServiceDoc struct {
+	ServiceName string    `json:"serviceName"`
+	Content     string    `json:"content"`
+	GeneratedAt time.Time `json:"generatedAt"`
+}
+
+// AgentGuide is the LLM-generated guide written for AI agents that will
+// query this knowledge base.
+type AgentGuide struct {
+	Content     string    `json:"content"`
+	GeneratedAt time.Time `json:"generatedAt"`
+}
