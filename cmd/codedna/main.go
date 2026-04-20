@@ -285,15 +285,19 @@ func cmdQuery(args []string) {
 		fatalf("resolve path: %v", err)
 	}
 
-	cfg := loadConfig()
-
-	manifest, found, err := knowledge.FindRepoByPath(cfg, abs)
+	// Look up the repo first (no credentials needed for the lookup).
+	baseCfg := loadConfigQuiet()
+	manifest, found, err := knowledge.FindRepoByPath(baseCfg, abs)
 	if err != nil {
 		fatalf("lookup: %v", err)
 	}
 	if !found {
 		fatalf("repo %s is not indexed — run `codedna index %s` first", abs, target)
 	}
+
+	// Now validate credentials and build the LLM client.
+	cfg := loadConfig()
+
 	fmt.Printf("Knowledge base: %s  (%d files, %d levels, model: %s)\n\n",
 		manifest.Repo.ID, manifest.Repo.FileCount, manifest.Repo.LevelsCount, manifest.Repo.Model)
 
@@ -342,7 +346,7 @@ func runQuery(queryFn func(context.Context, string) (*knowledge.QueryResult, err
 // ── list ──────────────────────────────────────────────────────────────────────
 
 func cmdList() {
-	cfg := loadConfig()
+	cfg := loadConfigQuiet()
 	manifests, err := knowledge.ListRepos(cfg)
 	if err != nil {
 		fatalf("list: %v", err)
@@ -436,7 +440,7 @@ func cmdExport(args []string) {
 		fatalf("resolve path: %v", err)
 	}
 
-	cfg := loadConfig()
+	cfg := loadConfigQuiet()
 	manifest, found, err := knowledge.FindRepoByPath(cfg, abs)
 	if err != nil {
 		fatalf("lookup: %v", err)
@@ -473,7 +477,7 @@ func cmdDiff(args []string) {
 		fatalf("resolve path: %v", err)
 	}
 
-	cfg := loadConfig()
+	cfg := loadConfigQuiet()
 	manifest, found, err := knowledge.FindRepoByPath(cfg, abs)
 	if err != nil {
 		fatalf("lookup: %v", err)
@@ -550,7 +554,7 @@ func cmdDocs(args []string) {
 		fatalf("resolve path: %v", err)
 	}
 
-	cfg := loadConfig()
+	cfg := loadConfigQuiet()
 	manifest, found, err := knowledge.FindRepoByPath(cfg, abs)
 	if err != nil {
 		fatalf("lookup: %v", err)
@@ -642,7 +646,7 @@ func cmdStatus(args []string) {
 		fatalf("resolve path: %v", err)
 	}
 
-	cfg := loadConfig()
+	cfg := loadConfigQuiet()
 	manifest, found, err := knowledge.FindRepoByPath(cfg, abs)
 	if err != nil {
 		fatalf("lookup: %v", err)
