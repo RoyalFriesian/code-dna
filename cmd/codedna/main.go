@@ -2,11 +2,17 @@
 //
 // Subcommands:
 //
-//	codedna init                 — interactive setup wizard
+//	codedna init                      — interactive setup wizard
 //	codedna index [--reindex] [path]  — index or incrementally reindex a repo
-//	codedna query [path] [question]  — query an indexed repo
-//	codedna list                 — list all indexed repos
-//	codedna status [path]        — show index status for a repo
+//	codedna reindex [path]            — shorthand for index --reindex
+//	codedna query [path] [question]   — query an indexed repo
+//	codedna list                      — list all indexed repos
+//	codedna status [path]             — show index status for a repo
+//	codedna config                    — show active configuration
+//	codedna export [path] [output]    — export master context to a file
+//	codedna diff [path]               — show files changed since last index
+//	codedna docs [path]               — list generated service docs
+//	codedna delete [path]             — remove indexed data for a repo
 package main
 
 import (
@@ -37,12 +43,24 @@ func main() {
 		cmdInit()
 	case "index":
 		cmdIndex(os.Args[2:])
+	case "reindex":
+		cmdIndex(append([]string{"--reindex"}, os.Args[2:]...))
 	case "query":
 		cmdQuery(os.Args[2:])
 	case "list":
 		cmdList()
 	case "status":
 		cmdStatus(os.Args[2:])
+	case "config":
+		cmdConfig()
+	case "export":
+		cmdExport(os.Args[2:])
+	case "diff":
+		cmdDiff(os.Args[2:])
+	case "docs":
+		cmdDocs(os.Args[2:])
+	case "delete", "remove":
+		cmdDelete(os.Args[2:])
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -347,6 +365,271 @@ func cmdList() {
 	w.Flush()
 }
 
+// ── config ───────────────────────────────────────────────────────────────────
+
+func cmdConfig() {
+	saved, err := knowledge.LoadSavedConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not read saved config: %v\n", err)
+	}
+	cfg := knowledge.ConfigFromEnv()
+	cfg = knowledge.ApplySavedConfig(cfg, saved)
+
+	fmt.Println("Active configuration:")
+	fmt.Println()
+
+	configPath := ""
+	if p, err := knowledge.ActiveConfigPath(); err == nil {
+		configPath = p
+	}
+	if configPath != "" {
+		fmt.Printf("  Config file:  %s\n", configPath)
+	} else {
+		fmt.Printf("  Config file:  (none — using env vars or defaults)\n")
+	}
+	fmt.Printf("  Storage dir:  %s\n", cfg.BaseDir)
+	fmt.Println()
+
+	provider := cfg.LLMProvider
+	if provider == "" {
+		provider = "openai (default)"
+	}
+	fmt.Printf("  Provider:     %s\n", provider)
+
+	switch llm.Provider(cfg.LLMProvider) {
+	case llm.ProviderOllama:
+		fmt.Printf("  Ollama URL:   %s\n", cfg.OllamaURL)
+		fmt.Printf("  Ollama model: %s\n", cfg.OllamaModel)
+	default:
+		masked := ""
+		if k := cfg.APIKey; k != "" {
+			masked = k[:min(8, len(k))] + "…"
+		}
+		if masked == "" {
+			masked = "(not set)"
+		}
+		fmt.Printf("  API key:      %s\n", masked)
+		fmt.Printf("  Index model:  %s\n", cfg.GetIndexModel())
+		fmt.Printf("  Query model:  %s\n", cfg.GetQueryModel())
+	}
+	fmt.Println()
+	fmt.Println("Run `codedna init` to update settings.")
+}
+
+// ── export ───────────────────────────────────────────────────────────────────
+
+func cmdExport(args []string) {
+	target := "."
+	outFile := ""
+	switch len(args) {
+	case 0:
+		// defaults
+	case 1:
+		target = args[0]
+	default:
+		target = args[0]
+		outFile = args[1]
+	}
+
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		fatalf("resolve path: %v", err)
+	}
+
+	cfg := loadConfig()
+	manifest, found, err := knowledge.FindRepoByPath(cfg, abs)
+	if err != nil {
+		fatalf("lookup: %v", err)
+	}
+	if !found {
+		fatalf("repo %s is not indexed — run `codedna index %s` first", abs, target)
+	}
+
+	content, err := knowledge.ReadMasterContext(cfg, manifest.Repo.ID, manifest)
+	if err != nil {
+		fatalf("read master context: %v", err)
+	}
+
+	if outFile == "" {
+		outFile = manifest.Repo.ID + "-knowledge.md"
+	}
+	if err := os.WriteFile(outFile, []byte(content), 0o644); err != nil {
+		fatalf("write file: %v", err)
+	}
+	fmt.Printf("Exported master context to: %s\n", outFile)
+	fmt.Printf("  Repo:   %s\n", manifest.Repo.Path)
+	fmt.Printf("  Size:   %d bytes\n", len(content))
+}
+
+// ── diff ─────────────────────────────────────────────────────────────────────
+
+func cmdDiff(args []string) {
+	target := "."
+	if len(args) > 0 {
+		target = args[0]
+	}
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		fatalf("resolve path: %v", err)
+	}
+
+	cfg := loadConfig()
+	manifest, found, err := knowledge.FindRepoByPath(cfg, abs)
+	if err != nil {
+		fatalf("lookup: %v", err)
+	}
+	if !found {
+		fatalf("repo %s is not indexed — run `codedna index %s` first", abs, target)
+	}
+
+	// Load the stored tree (hashes from last index).
+	storedTree, err := knowledge.ReadTree(cfg, manifest.Repo.ID)
+	if err != nil {
+		fatalf("read stored tree: %v", err)
+	}
+	storedHashes := make(map[string]string, len(storedTree))
+	for _, n := range storedTree {
+		storedHashes[n.Path] = n.Hash
+	}
+
+	// Scan the repo as it is now.
+	scan, err := knowledge.ScanRepo(abs, knowledge.ScanModeSmart)
+	if err != nil {
+		fatalf("scan: %v", err)
+	}
+	currentHashes := make(map[string]string, len(scan.Tree))
+	for _, n := range scan.Tree {
+		currentHashes[n.Path] = n.Hash
+	}
+
+	var added, modified, deleted []string
+	for path, hash := range currentHashes {
+		if stored, ok := storedHashes[path]; !ok {
+			added = append(added, path)
+		} else if stored != hash {
+			modified = append(modified, path)
+		}
+	}
+	for path := range storedHashes {
+		if _, ok := currentHashes[path]; !ok {
+			deleted = append(deleted, path)
+		}
+	}
+
+	total := len(added) + len(modified) + len(deleted)
+	if total == 0 {
+		fmt.Println("No changes since last index.")
+		return
+	}
+
+	fmt.Printf("Changes since last index (%s):\n\n", manifest.Repo.UpdatedAt.Format(time.RFC3339))
+	for _, f := range added {
+		fmt.Printf("  + %s\n", f)
+	}
+	for _, f := range modified {
+		fmt.Printf("  ~ %s\n", f)
+	}
+	for _, f := range deleted {
+		fmt.Printf("  - %s\n", f)
+	}
+	fmt.Printf("\n%d added, %d modified, %d deleted\n", len(added), len(modified), len(deleted))
+	if total > 0 {
+		fmt.Println("\nRun `codedna reindex .` to update the index.")
+	}
+}
+
+// ── docs ─────────────────────────────────────────────────────────────────────
+
+func cmdDocs(args []string) {
+	target := "."
+	if len(args) > 0 {
+		target = args[0]
+	}
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		fatalf("resolve path: %v", err)
+	}
+
+	cfg := loadConfig()
+	manifest, found, err := knowledge.FindRepoByPath(cfg, abs)
+	if err != nil {
+		fatalf("lookup: %v", err)
+	}
+	if !found {
+		fatalf("repo %s is not indexed — run `codedna index %s` first", abs, target)
+	}
+
+	names, err := knowledge.ListServiceDocs(cfg, manifest.Repo.ID)
+	if err != nil {
+		fatalf("list service docs: %v", err)
+	}
+
+	if len(names) == 0 {
+		fmt.Println("No service docs generated for this repo.")
+		return
+	}
+
+	fmt.Printf("Service docs for %s (%d):\n\n", manifest.Repo.ID, len(names))
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tPATH")
+	fmt.Fprintln(w, "────────────────────────\t────────────────────────")
+	for _, name := range names {
+		doc, err := knowledge.ReadServiceDoc(cfg, manifest.Repo.ID, name)
+		if err != nil {
+			fmt.Fprintf(w, "%s\t(unreadable: %v)\n", name, err)
+			continue
+		}
+		path := filepath.Join(cfg.BaseDir, manifest.Repo.ID, "service-docs", name+".json")
+		_ = doc
+		fmt.Fprintf(w, "%s\t%s\n", name, path)
+	}
+	w.Flush()
+}
+
+// ── delete ───────────────────────────────────────────────────────────────────
+
+func cmdDelete(args []string) {
+	target := "."
+	if len(args) > 0 {
+		target = args[0]
+	}
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		fatalf("resolve path: %v", err)
+	}
+
+	cfg := loadConfigQuiet()
+	manifest, found, err := knowledge.FindRepoByPath(cfg, abs)
+	if err != nil {
+		fatalf("lookup: %v", err)
+	}
+	if !found {
+		fmt.Printf("Not indexed: %s\nNothing to delete.\n", abs)
+		return
+	}
+
+	repoDir := filepath.Join(cfg.BaseDir, manifest.Repo.ID)
+	fmt.Printf("This will delete all indexed data for:\n")
+	fmt.Printf("  Repo:    %s\n", manifest.Repo.Path)
+	fmt.Printf("  ID:      %s\n", manifest.Repo.ID)
+	fmt.Printf("  Storage: %s\n", repoDir)
+	fmt.Printf("\nType the repo ID to confirm deletion: ")
+	os.Stdout.Sync()
+
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Scan()
+	confirm := strings.TrimSpace(sc.Text())
+	if confirm != manifest.Repo.ID {
+		fmt.Println("Cancelled.")
+		return
+	}
+
+	if err := os.RemoveAll(repoDir); err != nil {
+		fatalf("delete: %v", err)
+	}
+	fmt.Printf("\n✓ Deleted: %s\n", repoDir)
+}
+
 // ── status ────────────────────────────────────────────────────────────────────
 
 func cmdStatus(args []string) {
@@ -389,6 +672,13 @@ func cmdStatus(args []string) {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// loadConfigQuiet loads config without printing the provider/storage header.
+func loadConfigQuiet() knowledge.Config {
+	saved, _ := knowledge.LoadSavedConfig()
+	cfg := knowledge.ConfigFromEnv()
+	return knowledge.ApplySavedConfig(cfg, saved)
+}
 
 // loadConfig reads the persisted config, then overlays env vars.
 // It prints a one-line summary of what it loaded.
@@ -447,21 +737,33 @@ Usage:
   codedna <command> [flags] [args]
 
 Commands:
-  init                  Interactive setup wizard (storage path, LLM provider, API key)
-  index [path]          Full index of a repo (default: current directory)
-  index --reindex [path] Incremental reindex — only changed files
-  query [path] [question] Query an indexed repo (interactive if no question given)
-  list                  List all indexed repos
-  status [path]         Show index status for a repo
+  init                        Interactive setup wizard (storage path, LLM provider, API key)
+  config                      Show active configuration
+  index [path]                Full index of a repo (default: current directory)
+  index --reindex [path]      Incremental reindex — only changed files
+  reindex [path]              Shorthand for index --reindex
+  query [path] [question]     Query an indexed repo (interactive if no question given)
+  list                        List all indexed repos
+  status [path]               Show index status for a repo
+  diff [path]                 Show files changed since last index
+  docs [path]                 List generated service docs
+  export [path] [output]      Export master context to a markdown file
+  delete [path]               Remove indexed data for a repo (with confirmation)
 
 Examples:
   codedna init
+  codedna config
   codedna index .
+  codedna reindex .
   codedna index --reindex /path/to/repo
   codedna query . "how does authentication work?"
-  codedna query .          # interactive mode
+  codedna query .              # interactive mode
   codedna list
   codedna status .
+  codedna diff .
+  codedna docs .
+  codedna export . context.md
+  codedna delete .
 
 Configuration (in priority order):
   1. Environment variables  (OPENAI_API_KEY, LLM_PROVIDER, OLLAMA_URL, …)

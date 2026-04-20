@@ -106,3 +106,19 @@ func ApplySavedConfig(cfg Config, sc SavedConfig) Config {
 	}
 	return cfg
 }
+
+// ActiveConfigPath returns the path of the config file that would be loaded
+// by LoadSavedConfig, or an error if no file exists.
+func ActiveConfigPath() (string, error) {
+	candidates := []string{}
+	if dir := os.Getenv("KNOWLEDGE_BASE_DIR"); dir != "" {
+		candidates = append(candidates, savedConfigPath(dir))
+	}
+	candidates = append(candidates, savedConfigPath(""))
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", os.ErrNotExist
+}
