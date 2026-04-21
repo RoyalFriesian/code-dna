@@ -3,11 +3,24 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/RoyalFriesian/code-dna/pkg/knowledge"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// repoLocks prevents concurrent index/reindex operations on the same repository.
+var repoLocks sync.Map // map[string]*sync.Mutex
+
+func repoMutex(repoPath string) *sync.Mutex {
+	abs, _ := filepath.Abs(repoPath)
+	actual, _ := repoLocks.LoadOrStore(abs, &sync.Mutex{})
+	return actual.(*sync.Mutex)
+}
 
 // --- index_repo ---
 
@@ -157,6 +170,11 @@ func indexRepoHandler(cfg knowledge.Config, llm knowledge.CompletionClient) mcp.
 			return nil, IndexRepoOutput{}, fmt.Errorf("path is required")
 		}
 
+		// Serialize index operations per repo to avoid GPU contention.
+		mu := repoMutex(input.Path)
+		mu.Lock()
+		defer mu.Unlock()
+
 		// Apply deep mode if requested
 		indexCfg := cfg
 		if input.Deep {
@@ -180,12 +198,14 @@ func indexRepoHandler(cfg knowledge.Config, llm knowledge.CompletionClient) mcp.
 		}
 
 		var stages []string
+		startTime := time.Now()
 		progress := func(stage string, current, total int) {
 			msg := stage
 			if total > 0 {
 				msg = fmt.Sprintf("%s (%d/%d)", stage, current, total)
 			}
 			stages = append(stages, msg)
+			fmt.Fprintf(os.Stderr, "[index] %s  elapsed=%s\n", msg, time.Since(startTime).Round(time.Second))
 		}
 
 		manifest, err := knowledge.IndexRepo(ctx, llm, input.Path, indexCfg, progress)
@@ -285,8 +305,20 @@ func reindexRepoHandler(cfg knowledge.Config, llm knowledge.CompletionClient) mc
 			return nil, ReindexRepoOutput{}, fmt.Errorf("path is required")
 		}
 
+		// Serialize reindex operations per repo to avoid GPU contention.
+		mu := repoMutex(input.Path)
+		if !mu.TryLock() {
+			return nil, ReindexRepoOutput{}, fmt.Errorf("another index/reindex operation is already running for %s", input.Path)
+		}
+		defer mu.Unlock()
+
+		startTime := time.Now()
 		progress := func(stage string, current, total int) {
-			// Progress tracking for reindex
+			msg := stage
+			if total > 0 {
+				msg = fmt.Sprintf("%s (%d/%d)", stage, current, total)
+			}
+			fmt.Fprintf(os.Stderr, "[reindex] %s  elapsed=%s\n", msg, time.Since(startTime).Round(time.Second))
 		}
 
 		manifest, changedFiles, err := knowledge.ReindexRepo(ctx, llm, input.Path, cfg, progress)

@@ -115,7 +115,21 @@ func WriteAgentSummaries(cfg Config, repoID string, level int, agents []AgentSum
 			return err
 		}
 	}
-	// Build and write index: filepath → agent indices
+	return WriteAgentIndex(cfg, repoID, level, agents)
+}
+
+// WriteOneAgentSummary writes a single agent summary to disk (for incremental L1).
+func WriteOneAgentSummary(cfg Config, repoID string, level int, idx int, agent AgentSummary) error {
+	dir := filepath.Join(cfg.RepoDir(repoID), fmt.Sprintf("l%d", level), "agents")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("agent-%03d.json", idx))
+	return writeJSON(path, agent)
+}
+
+// WriteAgentIndex writes the filepath → agent-index routing map.
+func WriteAgentIndex(cfg Config, repoID string, level int, agents []AgentSummary) error {
 	index := make(map[string][]int)
 	for i, a := range agents {
 		for _, fp := range a.FilePaths {

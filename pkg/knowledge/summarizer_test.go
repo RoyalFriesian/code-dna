@@ -18,7 +18,9 @@ func TestSummarizeAgent_Basic(t *testing.T) {
 		FilePaths: []string{"main.go"},
 	}
 
-	result, err := SummarizeAgent(context.Background(), client, "test-model", dir, assignment, 0.10)
+	cfgBasic := DefaultConfig()
+	cfgBasic.CompressionRatio = 0.10
+	result, err := SummarizeAgent(context.Background(), client, "test-model", dir, assignment, cfgBasic)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -51,7 +53,9 @@ func TestSummarizeAgent_UnreadableFile(t *testing.T) {
 		FilePaths: []string{"nonexistent.go"},
 	}
 
-	result, err := SummarizeAgent(context.Background(), client, "test-model", dir, assignment, 0.10)
+	cfgUnread := DefaultConfig()
+	cfgUnread.CompressionRatio = 0.10
+	result, err := SummarizeAgent(context.Background(), client, "test-model", dir, assignment, cfgUnread)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -72,8 +76,10 @@ func TestSummarizeAgent_LLMError(t *testing.T) {
 		FilePaths: []string{"main.go"},
 	}
 
+	cfgErr := DefaultConfig()
+	cfgErr.CompressionRatio = 0.10
 	// Graceful degradation: should succeed with a placeholder summary, not return error
-	result, err := SummarizeAgent(context.Background(), client, "test-model", dir, assignment, 0.10)
+	result, err := SummarizeAgent(context.Background(), client, "test-model", dir, assignment, cfgErr)
 	if err != nil {
 		t.Fatalf("expected graceful degradation, got error: %v", err)
 	}

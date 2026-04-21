@@ -94,7 +94,10 @@ func CompressLevel(ctx context.Context, client CompletionClient, model string,
 	}
 
 	// Group summaries into clusters of ~groupSize
-	groupSize := 6
+	groupSize := cfg.CompressGroupSize
+	if groupSize <= 0 {
+		groupSize = 6
+	}
 	groups := groupSummaries(summaries, groupSize)
 
 	compressed := make([]AgentSummary, 0, len(groups))

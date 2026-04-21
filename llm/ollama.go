@@ -30,16 +30,18 @@ func NewOllama(baseURL, model string) *OllamaClient {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		model:   model,
 		http: &http.Client{
-			Timeout: 10 * time.Minute, // large models can be slow
+			Timeout: 30 * time.Minute, // 128K context can take a while on edge models
 		},
 	}
 }
 
 // ollamaChatRequest is the JSON body sent to /api/chat.
 type ollamaChatRequest struct {
-	Model    string          `json:"model"`
-	Messages []ollamaMessage `json:"messages"`
-	Stream   bool            `json:"stream"`
+	Model    string            `json:"model"`
+	Messages []ollamaMessage   `json:"messages"`
+	Stream   bool              `json:"stream"`
+	Options  map[string]any    `json:"options,omitempty"`
+	KeepAlive string           `json:"keep_alive,omitempty"`
 }
 
 type ollamaMessage struct {
@@ -67,9 +69,12 @@ func (c *OllamaClient) Generate(ctx context.Context, _ /*model*/ string, systemP
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		},
-		// No NumCtx override — let Ollama use the model's native context window.
-		// gemma4:e2b natively supports 131,072 tokens; forcing a lower value here
-		// would silently cap it.
+		// Keep the model loaded between calls to avoid reload latency.
+		KeepAlive: "30m",
+		// Use the model's full native context window (128K for gemma4:e2b/e4b).
+		Options: map[string]any{
+			"num_ctx": 131072,
+		},
 	}
 
 	body, err := json.Marshal(payload)
@@ -112,4 +117,12 @@ func (c *OllamaClient) Generate(ctx context.Context, _ /*model*/ string, systemP
 		return "", errors.New("empty response from ollama model")
 	}
 	return result, nil
+}
+
+// Warmup sends a trivial request to Ollama to ensure the model is loaded
+// into GPU memory before the real workload starts. This avoids paying the
+// model-load latency on the first real call.
+func (c *OllamaClient) Warmup(ctx context.Context) error {
+	_, err := c.Generate(ctx, "", "Reply with OK.", "ping")
+	return err
 }

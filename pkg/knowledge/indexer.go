@@ -56,7 +56,7 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 	}
 
 	// Phase 3: L1 Summarization
-	l1Summaries, err := SummarizeAllAgents(ctx, client, cfg.GetIndexModel(), absPath, assignments, cfg, progress)
+	l1Summaries, err := SummarizeAllAgents(ctx, client, cfg.GetIndexModel(), absPath, assignments, cfg, progress, repoID)
 	if err != nil {
 		repo.Status = "failed"
 		manifest.Repo = repo
@@ -68,8 +68,9 @@ func IndexRepo(ctx context.Context, client CompletionClient, repoPath string, cf
 		l1Summaries[i].RepoID = repoID
 	}
 
-	if err := WriteAgentSummaries(cfg, repoID, 1, l1Summaries); err != nil {
-		return nil, fmt.Errorf("write l1: %w", err)
+	// Agent files were written incrementally; write the index now.
+	if err := WriteAgentIndex(cfg, repoID, 1, l1Summaries); err != nil {
+		return nil, fmt.Errorf("write l1 index: %w", err)
 	}
 
 	l1Tokens := 0
@@ -231,7 +232,7 @@ func ReindexRepo(ctx context.Context, client CompletionClient, repoPath string, 
 			progress("distributing", 0, 0)
 		}
 		newAssignments := DistributeFiles(dirtyNodes, cfg)
-		newSummaries, err = SummarizeAllAgents(ctx, client, cfg.GetIndexModel(), absPath, newAssignments, cfg, progress)
+		newSummaries, err = SummarizeAllAgents(ctx, client, cfg.GetIndexModel(), absPath, newAssignments, cfg, progress, repoID)
 		if err != nil {
 			return nil, 0, fmt.Errorf("incremental l1 summarize: %w", err)
 		}
@@ -410,15 +411,17 @@ func finalizePipeline(
 		return nil, fmt.Errorf("write manifest: %w", err)
 	}
 
-	// Phase 5: Generate service architecture documents (non-fatal).
-	services := DetectServices(absPath, tree)
-	if _, err := GenerateServiceDocs(ctx, client, absPath, cfg, manifest, progress); err != nil {
-		fmt.Fprintf(os.Stderr, "service-docs warning: %v\n", err)
-	}
+	if !cfg.SkipPostProcess {
+		// Phase 5: Generate service architecture documents (non-fatal).
+		services := DetectServices(absPath, tree)
+		if _, err := GenerateServiceDocs(ctx, client, absPath, cfg, manifest, progress); err != nil {
+			fmt.Fprintf(os.Stderr, "service-docs warning: %v\n", err)
+		}
 
-	// Phase 6: Generate AI agent guide (non-fatal).
-	if _, err := GenerateAgentGuide(ctx, client, cfg, manifest, services, progress); err != nil {
-		fmt.Fprintf(os.Stderr, "agent-guide warning: %v\n", err)
+		// Phase 6: Generate AI agent guide (non-fatal).
+		if _, err := GenerateAgentGuide(ctx, client, cfg, manifest, services, progress); err != nil {
+			fmt.Fprintf(os.Stderr, "agent-guide warning: %v\n", err)
+		}
 	}
 
 	if progress != nil {

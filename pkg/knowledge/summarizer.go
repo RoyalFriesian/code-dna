@@ -2,10 +2,12 @@ package knowledge
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -69,6 +71,23 @@ Rules:
 - If a file is a test file, summarize what is tested, not how
 - PRESERVE ALL TIMESTAMPS — they are critical for cross-file correlation
 - PRESERVE EXACT COUNTS — approximate counts are not acceptable for data files`
+
+// l1CompactPrompt is a shorter system prompt for local/smaller models (e.g. Ollama).
+// It produces faster results by reducing instruction overhead.
+const l1CompactPrompt = `You are a code summarization agent. Create a structured summary of the files provided.
+
+For each file include:
+- Package/module name and purpose (1 line)
+- All exported/public symbols: type, name, signature
+- Key functions: name, params, return types, purpose
+- Struct/class definitions with key fields
+- Architecture patterns and data flow
+
+Rules:
+- Max output: %d tokens (~%d%% of input)
+- Use clear headings per file
+- Include line numbers for important items
+- Facts only — no opinions`
 
 // isContextLengthError returns true when the LLM rejected the request
 // because the combined prompt exceeded its context window.
@@ -167,13 +186,34 @@ func detectFileType(path string) string {
 	return "unknown"
 }
 
+// agentFileHash computes a combined hash of all files in an assignment.
+// Files are sorted by path for determinism.
+func agentFileHash(repoRoot string, filePaths []string) string {
+	sorted := make([]string, len(filePaths))
+	copy(sorted, filePaths)
+	sort.Strings(sorted)
+
+	h := sha256.New()
+	for _, fp := range sorted {
+		data, err := os.ReadFile(filepath.Join(repoRoot, fp))
+		if err != nil {
+			continue
+		}
+		h.Write([]byte(fp))
+		h.Write(data)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)[:16])
+}
+
 // SummarizeAgent produces an L1 summary for a single agent assignment.
 // It handles context-length errors by truncating files to 50% and retrying,
 // and handles rate-limit errors with exponential backoff.
 func SummarizeAgent(ctx context.Context, client CompletionClient, model string, repoRoot string,
-	assignment AgentAssignment, compressionRatio float64) (AgentSummary, error) {
+	assignment AgentAssignment, cfg Config) (AgentSummary, error) {
 
+	compressionRatio := cfg.CompressionRatio
 	userPrompt, totalInputTokens := buildAgentPrompt(repoRoot, assignment, 1.0)
+	hash := agentFileHash(repoRoot, assignment.FilePaths)
 
 	if totalInputTokens == 0 {
 		return AgentSummary{
@@ -182,7 +222,22 @@ func SummarizeAgent(ctx context.Context, client CompletionClient, model string, 
 			FilePaths: assignment.FilePaths,
 			Summary:   "No readable content.",
 			Tokens:    0,
+			FileHash:  hash,
 		}, nil
+	}
+
+	// Proactive truncation: Ollama silently clips input beyond num_ctx
+	// instead of returning an error, so the context-length retry never fires.
+	// gemma4:e2b supports 128K context natively. Use ~65% for input to leave
+	// room for the system prompt and generated output (best perf at 60-70%).
+	const maxInputTokens = 83000
+	truncFrac := 1.0
+	if totalInputTokens > maxInputTokens {
+		truncFrac = float64(maxInputTokens) / float64(totalInputTokens)
+		slog.Warn("input exceeds context window, pre-truncating",
+			"agent", assignment.Index, "inputTokens", totalInputTokens,
+			"truncFrac", fmt.Sprintf("%.2f", truncFrac))
+		userPrompt, totalInputTokens = buildAgentPrompt(repoRoot, assignment, truncFrac)
 	}
 
 	targetTokens := int(float64(totalInputTokens) * compressionRatio)
@@ -190,7 +245,12 @@ func SummarizeAgent(ctx context.Context, client CompletionClient, model string, 
 		targetTokens = 100
 	}
 	pct := int(compressionRatio * 100)
-	systemPrompt := fmt.Sprintf(l1SystemPrompt, targetTokens, pct)
+	var systemPrompt string
+	if cfg.CompactPrompts {
+		systemPrompt = fmt.Sprintf(l1CompactPrompt, targetTokens, pct)
+	} else {
+		systemPrompt = fmt.Sprintf(l1SystemPrompt, targetTokens, pct)
+	}
 
 	// callLLM wraps the Generate call with rate-limit retry.
 	callLLM := func(sys, user string) (string, error) {
@@ -228,6 +288,9 @@ func SummarizeAgent(ctx context.Context, client CompletionClient, model string, 
 			truncTarget = 100
 		}
 		truncSystem := fmt.Sprintf(l1SystemPrompt, truncTarget, pct)
+		if cfg.CompactPrompts {
+			truncSystem = fmt.Sprintf(l1CompactPrompt, truncTarget, pct)
+		}
 		response, err = callLLM(truncSystem, truncatedPrompt)
 	}
 
@@ -247,6 +310,7 @@ func SummarizeAgent(ctx context.Context, client CompletionClient, model string, 
 			FilePaths: assignment.FilePaths,
 			Summary:   placeholder,
 			Tokens:    estimateTokens(int64(len(placeholder))),
+			FileHash:  hash,
 		}, nil
 	}
 
@@ -256,18 +320,29 @@ func SummarizeAgent(ctx context.Context, client CompletionClient, model string, 
 		FilePaths: assignment.FilePaths,
 		Summary:   response,
 		Tokens:    estimateTokens(int64(len(response))),
+		FileHash:  hash,
 	}, nil
 }
 
 // SummarizeAllAgents runs L1 summarization across all assignments concurrently.
+// When repoID is non-empty, each agent summary is written to disk as soon as it
+// completes (incremental persistence). The index file is written at the end.
 func SummarizeAllAgents(ctx context.Context, client CompletionClient, model string, repoRoot string,
-	assignments []AgentAssignment, cfg Config, progress ProgressFunc) ([]AgentSummary, error) {
+	assignments []AgentAssignment, cfg Config, progress ProgressFunc, repoID ...string) ([]AgentSummary, error) {
+
+	// Determine whether to write incrementally.
+	incrementalID := ""
+	if len(repoID) > 0 && repoID[0] != "" {
+		incrementalID = repoID[0]
+	}
 
 	results := make([]AgentSummary, len(assignments))
 	errs := make([]error, len(assignments))
 
 	sem := make(chan struct{}, cfg.Concurrency)
 	var wg sync.WaitGroup
+	var completedCount int32
+	var mu sync.Mutex
 
 	for i, a := range assignments {
 		wg.Add(1)
@@ -281,7 +356,7 @@ func SummarizeAllAgents(ctx context.Context, client CompletionClient, model stri
 				return
 			}
 
-			result, err := SummarizeAgent(ctx, client, model, repoRoot, assign, cfg.CompressionRatio)
+			result, err := SummarizeAgent(ctx, client, model, repoRoot, assign, cfg)
 			if err != nil {
 				errs[idx] = err
 				return
@@ -289,8 +364,20 @@ func SummarizeAllAgents(ctx context.Context, client CompletionClient, model stri
 			result.RepoID = "" // will be set by caller
 			results[idx] = result
 
+			// Write to disk immediately so progress is visible.
+			if incrementalID != "" {
+				if wErr := WriteOneAgentSummary(cfg, incrementalID, 1, idx, result); wErr != nil {
+					slog.Warn("incremental write failed", "agent", idx, "err", wErr)
+				}
+			}
+
 			if progress != nil {
-				progress("l1-summarize", idx+1, len(assignments))
+				mu.Lock()
+				completedCount++
+				done := int(completedCount)
+				mu.Unlock()
+				remaining := len(assignments) - done
+				progress("l1-summarize", remaining, len(assignments))
 			}
 		}(i, a)
 	}

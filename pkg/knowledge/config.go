@@ -23,6 +23,9 @@ type Config struct {
 	Concurrency      int      // Worker pool size for L1 summarization
 	AgentFileLimit   int      // Max files per agent assignment
 	AgentTokenBudget int      // Target raw token budget per L1 agent
+	CompressGroupSize int     // Summaries per compression group (default 6)
+	CompactPrompts   bool     // Use shorter prompts (for local/smaller models)
+	SkipPostProcess  bool     // Skip service-doc and agent-guide generation (saves LLM calls)
 	ScanMode         ScanMode // "smart" (default) skips deps/generated; "deep" indexes everything
 }
 
@@ -85,6 +88,7 @@ func DefaultConfig() Config {
 		Concurrency:      5,
 		AgentFileLimit:   5,
 		AgentTokenBudget: 50000,
+		CompressGroupSize: 6,
 		ScanMode:         ScanModeSmart,
 	}
 }
@@ -146,6 +150,25 @@ func ConfigFromEnv() Config {
 		}
 	}
 
+	// Tune defaults for Ollama: local GPU can only run one generation at a
+	// time, so high concurrency just queues requests.  Lower target tokens
+	// and a higher compression ratio reduce the number of LLM calls needed.
+	if cfg.LLMProvider == "ollama" {
+		if os.Getenv("KNOWLEDGE_CONCURRENCY") == "" {
+			cfg.Concurrency = 3
+		}
+		if os.Getenv("KNOWLEDGE_TARGET_TOKENS") == "" {
+			cfg.TargetTokens = 20000
+		}
+		if os.Getenv("KNOWLEDGE_COMPRESSION_RATIO") == "" {
+			cfg.CompressionRatio = 0.25
+		}
+		cfg.CompressGroupSize = 3
+		cfg.AgentFileLimit = 5
+		cfg.CompactPrompts = true
+		cfg.SkipPostProcess = true
+	}
+
 	return cfg
 }
 
@@ -156,6 +179,16 @@ func (c Config) RepoDir(repoID string) string {
 
 // Validate checks that required configuration fields are present.
 func (c Config) Validate() error {
+	// Ollama provider doesn't need an OpenAI key.
+	if c.LLMProvider == "ollama" {
+		if c.OllamaURL == "" {
+			return &configError{"OLLAMA_URL is required when LLM_PROVIDER=ollama"}
+		}
+		if c.OllamaModel == "" {
+			return &configError{"OLLAMA_MODEL is required when LLM_PROVIDER=ollama"}
+		}
+		return nil
+	}
 	if c.APIKey == "" {
 		return errMissingAPIKey
 	}
